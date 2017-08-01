@@ -41,6 +41,7 @@ namespace Orchard.OutputCache.Filters {
         private readonly ICacheService _cacheService;
         private readonly ISignals _signals;
         private readonly ShellSettings _shellSettings;
+        private readonly ICachingEventHandler _cachingEvents;
         private bool _isDisposed = false;
 
         public ILogger Logger { get; set; }
@@ -55,7 +56,8 @@ namespace Orchard.OutputCache.Filters {
             IClock clock,
             ICacheService cacheService,
             ISignals signals,
-            ShellSettings shellSettings) {
+            ShellSettings shellSettings,
+            ICachingEventHandler cachingEvents) {
 
             _cacheManager = cacheManager;
             _cacheStorageProvider = cacheStorageProvider;
@@ -67,6 +69,7 @@ namespace Orchard.OutputCache.Filters {
             _cacheService = cacheService;
             _signals = signals;
             _shellSettings = shellSettings;
+            _cachingEvents = cachingEvents;
 
             Logger = NullLogger.Instance;
         }
@@ -290,7 +293,7 @@ namespace Orchard.OutputCache.Filters {
                 var action = filterContext.ActionDescriptor.ActionName;
                 var culture = _workContext.CurrentCulture.ToLowerInvariant();
                 var auth = filterContext.HttpContext.User.Identity.IsAuthenticated.ToString().ToLowerInvariant();
-                var theme = _themeManager.GetRequestTheme(filterContext.RequestContext).Id.ToLowerInvariant();
+                var theme = _workContext.CurrentTheme.Id.ToLowerInvariant();
 
                 itemDescriptor = string.Format("{0} (Area: {1}, Controller: {2}, Action: {3}, Culture: {4}, Theme: {5}, Auth: {6})", url, area, controller, action, culture, theme, auth);
             }
@@ -380,13 +383,22 @@ namespace Orchard.OutputCache.Filters {
             result.Add("scheme", filterContext.RequestContext.HttpContext.Request.Url.Scheme);
 
             // Vary by theme.
-            result.Add("theme", _themeManager.GetRequestTheme(filterContext.RequestContext).Id.ToLowerInvariant());
+            result.Add("theme", _workContext.CurrentTheme.Id.ToLowerInvariant());
 
             // Vary by configured query string parameters.
             var queryString = filterContext.RequestContext.HttpContext.Request.QueryString;
             foreach (var key in queryString.AllKeys) {
-                if (key == null || (CacheSettings.VaryByQueryStringParameters != null && !CacheSettings.VaryByQueryStringParameters.Contains(key)))
+                if (key == null)
                     continue;
+
+                // In exclusive mode, don't vary if the key matches
+                if (CacheSettings.VaryByQueryStringIsExclusive && (CacheSettings.VaryByQueryStringParameters != null && CacheSettings.VaryByQueryStringParameters.Contains(key)))
+                    continue;
+
+                // In inclusive mode, don't vary if the key doesn't match
+                if(!CacheSettings.VaryByQueryStringIsExclusive && (CacheSettings.VaryByQueryStringParameters == null || !CacheSettings.VaryByQueryStringParameters.Contains(key)))
+                    continue;
+
                 result[key] = queryString[key];
             }
 
@@ -397,6 +409,12 @@ namespace Orchard.OutputCache.Filters {
                     result["HEADER:" + varyByRequestHeader] = requestHeaders[varyByRequestHeader];
             }
 
+            // Vary by configured cookies.
+            var requestCookies = filterContext.RequestContext.HttpContext.Request.Cookies;
+            foreach (var varyByRequestCookies in CacheSettings.VaryByRequestCookies) {
+                if (requestCookies[varyByRequestCookies] != null)
+                    result["COOKIE:" + varyByRequestCookies] = requestCookies[varyByRequestCookies].Value;
+            }
 
             // Vary by request culture if configured.
             if (CacheSettings.VaryByCulture) {
@@ -609,6 +627,9 @@ namespace Orchard.OutputCache.Filters {
                     keyBuilder.AppendFormat("{0}={1};", pair.Key.ToLowerInvariant(), Convert.ToString(pair.Value).ToLowerInvariant());
                 }
             }
+
+            //make CacheKey morphable by external modules
+            _cachingEvents.KeyGenerated(keyBuilder);
 
             return keyBuilder.ToString();
         }
